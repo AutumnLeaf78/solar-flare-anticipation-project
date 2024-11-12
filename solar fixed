@@ -1,0 +1,119 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sunpy.net import Fido
+from sunpy.net import attrs as a
+from sunpy.timeseries import TimeSeries
+
+# Define start and end times for the data retrieval
+tstart = "2024-02-25 00:00"
+tend = "2024-02-25 23:59"
+
+# Search and fetch GOES data
+result = Fido.search(a.Time(tstart, tend), a.Instrument("XRS"))
+goes_files = Fido.fetch(result)
+goes_ts = TimeSeries(goes_files[0])  # Load the TimeSeries object from the fetched files
+
+# Convert the GOES data to a DataFrame for easier manipulation
+data = goes_ts.to_dataframe().reset_index()
+data.rename(columns={'index': 'time', 'xrsa': 'short_flux', 'xrsb': 'long_flux'}, inplace=True)
+
+# More relaxed thresholds for FAI flag (less stringent conditions)
+DELTA_EM_THRESHOLD = 1e-9    # Lower threshold for emission measure change (less stringent)
+TEMP_MIN = 0.0001            # Lower minimum temperature for flare detection (less stringent)
+TEMP_MAX = 0.005             # Raised maximum temperature for flare detection (wider window)
+DURATION_THRESHOLD = 600     # Increased duration (in seconds) for the sustained condition check (longer flare event)
+
+# Calculate dEM/dt (rate of change in emission measure) as the derivative of long_flux
+data['emission_measure'] = data['long_flux']
+data['dEM_dt'] = data['emission_measure'].diff() / data['time'].diff().dt.total_seconds()
+
+# Adjust temperature scaling factor for flare detection (check if 10000 is too high)
+data['temperature'] = data['short_flux'] * 1000  # Adjusted scaling factor for temperature
+
+# Apply the FAI condition with the new, more relaxed parameters
+def calculate_fai_flags(data):
+    flags = []
+    for i, row in data.iterrows():
+        # Determine the window to check the conditions
+        window_start = max(i - DURATION_THRESHOLD, 0)
+        window_end = min(i + DURATION_THRESHOLD, len(data) - 1)
+
+        window_data = data.iloc[window_start:window_end]
+
+        # Check if the condition is met in the window
+        condition_met = (
+            (window_data['dEM_dt'] >= DELTA_EM_THRESHOLD) &
+            (window_data['temperature'] >= TEMP_MIN) &
+            (window_data['temperature'] <= TEMP_MAX)
+        ).any()
+
+        if condition_met:
+            # Mark the peak within the window, if any condition met
+            peak_time_idx = window_data['long_flux'].idxmax()  # Find the peak flux
+            flags.append(1 if row.name == peak_time_idx else 0)  # Flag only the peak point
+        else:
+            flags.append(0)
+
+    return flags
+
+data['FAI_flag'] = calculate_fai_flags(data)
+
+# Debugging Information: Print out some statistics and sample data
+print("Adjusted Emission Measure Change Rate (dEM_dt) Statistics:")
+print(data['dEM_dt'].describe())
+
+print("\nAdjusted Temperature Statistics:")
+print(data['temperature'].describe())
+
+# Check how many points meet the flagging conditions
+condition_check = (
+    (data['dEM_dt'] >= DELTA_EM_THRESHOLD) &
+    (data['temperature'] >= TEMP_MIN) &
+    (data['temperature'] <= TEMP_MAX)
+)
+print("\nCondition Check Results (True for meeting condition, False for not):")
+print(condition_check.value_counts())
+
+# Display the Flagged Entries
+flagged_entries = data[data['FAI_flag'] == 1][['time', 'FAI_flag']]
+print("\nFlagged Entries after further adjustments:")
+print(flagged_entries)
+
+# Plotting the Flare Detection and the Related Parameters
+
+# Create a plot with multiple subplots
+fig, axs = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
+
+# Plot 1: GOES Flux (1-8 Å and 0.5-4 Å)
+axs[0].plot(data['time'], data['long_flux'], color='blue', label='GOES 1-8 Å Flux')
+axs[0].plot(data['time'], data['short_flux'], color='orange', label='GOES 0.5-4 Å Flux')
+axs[0].scatter(data[data['FAI_flag'] == 1]['time'], data[data['FAI_flag'] == 1]['long_flux'],
+                color='red', marker='x', label='FAI Flag (Peak)')
+axs[0].set_yscale('log')
+axs[0].set_ylabel('Flux (W/m²)')
+axs[0].set_title('GOES X-ray Flux with FAI-based Solar Flare Detection (Relaxed)')
+axs[0].legend()
+axs[0].grid(True)
+
+# Plot 2: Temperature
+axs[1].plot(data['time'], data['temperature'], color='green', label='Temperature')
+axs[1].scatter(data[data['FAI_flag'] == 1]['time'], data[data['FAI_flag'] == 1]['temperature'],
+               color='red', marker='x', label='FAI Flag (Peak)')
+axs[1].set_ylabel('Temperature (Scaled)')
+axs[1].set_title('Temperature during Solar Flare Events')
+axs[1].legend()
+axs[1].grid(True)
+
+# Plot 3: dEM/dt (Rate of Change in Emission Measure)
+axs[2].plot(data['time'], data['dEM_dt'], color='purple', label='dEM/dt')
+axs[2].scatter(data[data['FAI_flag'] == 1]['time'], data[data['FAI_flag'] == 1]['dEM_dt'],
+               color='red', marker='x', label='FAI Flag (Peak)')
+axs[2].set_xlabel('Time')
+axs[2].set_ylabel('dEM/dt (W/m²/s)')
+axs[2].set_title('Rate of Change of Emission Measure (dEM/dt) during Solar Flare Events')
+axs[2].legend()
+axs[2].grid(True)
+
+plt.tight_layout()
+plt.show()
